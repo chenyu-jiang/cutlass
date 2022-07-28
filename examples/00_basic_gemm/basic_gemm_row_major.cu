@@ -86,7 +86,7 @@
 #define BLOCK_REPEAT 4
 #define BLOCK_DIM ((THREAD_BLOCK_SIZE)*(BLOCK_REPEAT))
 
-#define COMM_UNIT_LANES 2
+#define COMM_UNIT_LANES 4
 
 #define MPICHECK(cmd) do {                          \
   int e = cmd;                                      \
@@ -333,7 +333,7 @@ __global__ void ReferenceGemm_kernel(
     for (int bj=0; bj < BLOCK_REPEAT; bj++) {
       int i = threadIdx.x + blockIdx.x * BLOCK_DIM + bi * THREAD_BLOCK_SIZE;
       int j = threadIdx.y + blockIdx.y * BLOCK_DIM + bj * THREAD_BLOCK_SIZE;
-      if (i < N && j < M) {
+      if (i < M && j < N) {
         float accumulator = 0;
 
         for (int k = 0; k < K; ++k) {
@@ -365,7 +365,7 @@ __global__ void ReferenceGemm_kernel_with_progress(
     for (int bj=0; bj< BLOCK_REPEAT; bj++) {
       int i = threadIdx.x + blockIdx.x * BLOCK_DIM + bi * THREAD_BLOCK_SIZE;
       int j = threadIdx.y + blockIdx.y * BLOCK_DIM + bj * THREAD_BLOCK_SIZE;
-      if (i < N && j < M) {
+      if (i < M && j < N) {
         float accumulator = 0;
 
         for (int k = 0; k < K; ++k) {
@@ -523,6 +523,22 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta,
 
     return result;
   }
+
+  std::unordered_set<int> unfinished_block_ids;
+  for(int i=0;i<(M/BLOCK_DIM)*(N/BLOCK_DIM);i++) {
+    unfinished_block_ids.insert(i);
+  }
+
+  std::vector<std::unordered_set<int>> comm_lanes_tracker;
+
+  for (int m=0; m<(M / BLOCK_DIM); m++) {
+    std::unordered_set<int> comm_lane_blocks;
+    for (int n=0; n < (N / BLOCK_DIM); n++) {
+      int block_id = (N / BLOCK_DIM) * m + n;
+      comm_lane_blocks.insert(block_id);
+    }
+    comm_lanes_tracker.emplace_back(std::move(comm_lane_blocks));
+  }
   // serialize original arrays
   // std::ofstream Af;
   // std::ofstream Bf;
@@ -555,100 +571,66 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta,
   // Launch CUTLASS GEMM.
   //
   std::cout << "Launching CUTLASS GEMM kernel." << std::endl;
+  // for (int i=0; i<50; i++)
+  result = CutlassSgemmNN(M, N, K, alpha, A, lda, B, ldb, beta, C_cutlass, ldc, device_progress);
+  // for (int i=0; i<50; i++)
+    // result = ReferenceGemm_with_progress(M, N, K, alpha, A, lda, B, ldb, beta, C_cutlass, ldc, device_progress);
 
   std::vector<std::pair<std::chrono::_V2::system_clock::time_point, const int>> timestamps;
 
-  for (int i=0; i<50; i++) {
-    for(int i=0; i < (M/BLOCK_DIM)*(N/BLOCK_DIM); i++) {
-      *(host_progress+i) = 0;
-    }
+  if (result != cudaSuccess) {
+    std::cerr << "CUTLASS GEMM kernel failed: "
+      << cudaGetErrorString(result) << std::endl;
 
-    std::unordered_set<int> unfinished_block_ids;
-    for(int i=0;i<(M/BLOCK_DIM)*(N/BLOCK_DIM);i++) {
-      unfinished_block_ids.insert(i);
-    }
+    cudaFree(C_reference);
+    cudaFree(C_cutlass);
+    cudaFree(B);
+    cudaFree(A);
 
-    std::vector<std::unordered_set<int>> comm_lanes_tracker;
-
-    for (int m=0; m<(M / BLOCK_DIM); m++) {
-      std::unordered_set<int> comm_lane_blocks;
-      for (int n=0; n < (N / BLOCK_DIM); n++) {
-        int block_id = (N / BLOCK_DIM) * m + n;
-        comm_lane_blocks.insert(block_id);
-      }
-      comm_lanes_tracker.emplace_back(std::move(comm_lane_blocks));
-    }
-
-    result = CutlassSgemmNN(M, N, K, alpha, A, lda, B, ldb, beta, C_cutlass, ldc, device_progress);
-    if (result != cudaSuccess) {
-      std::cerr << "CUTLASS GEMM kernel failed: "
-        << cudaGetErrorString(result) << std::endl;
-
-      cudaFree(C_reference);
-      cudaFree(C_cutlass);
-      cudaFree(B);
-      cudaFree(A);
-
-      return result;
-    }
-    // spin check for progress
-    int current_lane = 0;
-    do{
-      int idx_to_remove = -1;
-      for (const auto& elem: unfinished_block_ids) {
-        if (*(host_progress+elem) == 1) {
-          idx_to_remove = elem;
-          timestamps.push_back(std::make_pair(std::chrono::high_resolution_clock::now(), elem));
-          // std::cout << "Block " << elem << " finished." << std::endl;
-          comm_lanes_tracker[elem / (N/BLOCK_DIM)].erase(elem);
-          while (comm_lanes_tracker[current_lane].empty() && current_lane < M/BLOCK_DIM) {
-            current_lane ++;
-            if (current_lane % COMM_UNIT_LANES == 0) {
-              float* buffer = C_cutlass + (current_lane-COMM_UNIT_LANES) * N * BLOCK_DIM;
-              // entire block lane finished, call NCCL
-              // std::cout << "Launching NCCL on offset " << current_lane * N * BLOCK_DIM << "." << std::endl;
-              // NCCLCHECK(ncclAllReduce((const void*)buffer, (void*)buffer, N * BLOCK_DIM * COMM_UNIT_LANES, ncclFloat, ncclSum,
-              // comm, s));
-            }
-          }
-          break;
-        }
-      }
-      if (idx_to_remove != -1) {
-        unfinished_block_ids.erase(idx_to_remove);
-      }
-    }
-    while (!unfinished_block_ids.empty());
-
-    // printf("CUTLASS kernel finished.\n");
-
-    CUDACHECK(cudaDeviceSynchronize());
-    NCCLCHECK(ncclAllReduce((const void*)C_cutlass, (void*)C_cutlass, M*N, ncclFloat, ncclSum,
-    comm, s));
-    CUDACHECK(cudaDeviceSynchronize());
-    // std::cout << "Timestamps: " << std::endl;
-    // for (const auto &st: timestamps) {
-    //   auto timestamp = st.first;
-    //   int block_id = st.second;
-    //   std::cout << timestamp.time_since_epoch().count() << ", Block " << block_id << std::endl;
-    // }
+    return result;
   }
-  
-  // for (int i=0; i<1; i++)
-    // result = ReferenceGemm_with_progress(M, N, K, alpha, A, lda, B, ldb, beta, C_cutlass, ldc, device_progress);
 
+  spin check for progress
+  int current_lane = 0;
+  do{
+    int idx_to_remove = -1;
+    for (const auto& elem: unfinished_block_ids) {
+      if (*(host_progress+elem) == 1) {
+        idx_to_remove = elem;
+        timestamps.push_back(std::make_pair(std::chrono::high_resolution_clock::now(), elem));
+        // std::cout << "Block " << elem << " finished." << std::endl;
+        comm_lanes_tracker[elem / (N/BLOCK_DIM)].erase(elem);
+        while (comm_lanes_tracker[current_lane].empty() && current_lane < M/BLOCK_DIM) {
+          current_lane ++;
+          if (current_lane % COMM_UNIT_LANES == 0) {
+            float* buffer = C_cutlass + (current_lane-COMM_UNIT_LANES) * N * BLOCK_DIM;
+            // entire block lane finished, call NCCL
+            std::cout << "Launching NCCL on offset " << current_lane * N * BLOCK_DIM << "." << std::endl;
+            NCCLCHECK(ncclAllReduce((const void*)buffer, (void*)buffer, N * BLOCK_DIM * COMM_UNIT_LANES, ncclFloat, ncclSum,
+            comm, s));
+          }
+        }
+        break;
+      }
+    }
+    if (idx_to_remove != -1) {
+      unfinished_block_ids.erase(idx_to_remove);
+    }
+  }
+  while (!unfinished_block_ids.empty());
 
-  // if (result != cudaSuccess) {
-  //   std::cerr << "CUTLASS GEMM kernel failed: "
-  //     << cudaGetErrorString(result) << std::endl;
+  printf("CUTLASS kernel finished.\n");
 
-  //   cudaFree(C_reference);
-  //   cudaFree(C_cutlass);
-  //   cudaFree(B);
-  //   cudaFree(A);
+  CUDACHECK(cudaDeviceSynchronize());
 
-  //   return result;
+  // std::cout << "Timestamps: " << std::endl;
+  // for (const auto &st: timestamps) {
+  //   auto timestamp = st.first;
+  //   int block_id = st.second;
+  //   std::cout << timestamp.time_since_epoch().count() << ", Block " << block_id << std::endl;
   // }
+ 
+  std::cout << "Launching reference GEMM." << std::endl;
 
   //
   // Verify.
@@ -656,59 +638,59 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta,
 
   // Launch reference GEMM
   // for (int i=0;i<50;i++) 
-  // result = ReferenceGemm(M, N, K, alpha, A, lda, B, ldb, beta, C_reference, ldc);
+  result = ReferenceGemm(M, N, K, alpha, A, lda, B, ldb, beta, C_reference, ldc);
 
-  // if (result != cudaSuccess) {
-  //   std::cerr << "Reference GEMM kernel failed: "
-  //     << cudaGetErrorString(result) << std::endl;
+  if (result != cudaSuccess) {
+    std::cerr << "Reference GEMM kernel failed: "
+      << cudaGetErrorString(result) << std::endl;
 
-  //   cudaFree(C_reference);
-  //   cudaFree(C_cutlass);
-  //   cudaFree(B);
-  //   cudaFree(A);
+    cudaFree(C_reference);
+    cudaFree(C_cutlass);
+    cudaFree(B);
+    cudaFree(A);
 
-  //   return result;
-  // }
+    return result;
+  }
 
-  // CUDACHECK(cudaDeviceSynchronize());
+  CUDACHECK(cudaDeviceSynchronize());
 
-  // // we average reference GEMM as well
-  // NCCLCHECK(ncclAllReduce((const void*)C_reference, (void*)C_reference, M*N, ncclFloat, ncclSum,
-  // comm, s));
+  // we average reference GEMM as well
+  NCCLCHECK(ncclAllReduce((const void*)C_reference, (void*)C_reference, M*N, ncclFloat, ncclSum,
+  comm, s));
 
-  // CUDACHECK(cudaDeviceSynchronize());
+  CUDACHECK(cudaDeviceSynchronize());
 
   // Copy to host and verify equivalence.
-  // std::vector<float> host_cutlass(ldc * M, 0);
-  // std::vector<float> host_reference(ldc * M, 0);
+  std::vector<float> host_cutlass(ldc * M, 0);
+  std::vector<float> host_reference(ldc * M, 0);
 
-  // result = cudaMemcpy(host_cutlass.data(), C_cutlass, sizeof_C, cudaMemcpyDeviceToHost);
+  result = cudaMemcpy(host_cutlass.data(), C_cutlass, sizeof_C, cudaMemcpyDeviceToHost);
 
-  // if (result != cudaSuccess) {
-  //   std::cerr << "Failed to copy CUTLASS GEMM results: "
-  //     << cudaGetErrorString(result) << std::endl;
+  if (result != cudaSuccess) {
+    std::cerr << "Failed to copy CUTLASS GEMM results: "
+      << cudaGetErrorString(result) << std::endl;
 
-  //   cudaFree(C_reference);
-  //   cudaFree(C_cutlass);
-  //   cudaFree(B);
-  //   cudaFree(A);
+    cudaFree(C_reference);
+    cudaFree(C_cutlass);
+    cudaFree(B);
+    cudaFree(A);
 
-  //   return result;
-  // }
+    return result;
+  }
 
-  // result = cudaMemcpy(host_reference.data(), C_reference, sizeof_C, cudaMemcpyDeviceToHost);
+  result = cudaMemcpy(host_reference.data(), C_reference, sizeof_C, cudaMemcpyDeviceToHost);
 
-  // if (result != cudaSuccess) {
-  //   std::cerr << "Failed to copy Reference GEMM results: "
-  //     << cudaGetErrorString(result) << std::endl;
+  if (result != cudaSuccess) {
+    std::cerr << "Failed to copy Reference GEMM results: "
+      << cudaGetErrorString(result) << std::endl;
 
-  //   cudaFree(C_reference);
-  //   cudaFree(C_cutlass);
-  //   cudaFree(B);
-  //   cudaFree(A);
+    cudaFree(C_reference);
+    cudaFree(C_cutlass);
+    cudaFree(B);
+    cudaFree(A);
 
-  //   return result;
-  // }
+    return result;
+  }
 
   CUDACHECK(cudaDeviceSynchronize());
 
@@ -735,15 +717,15 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta,
   //
   // Test for bit equivalence of results.
   //
-  // double sum_of_difference = 0;
-  // for (int i=0;i<ldc * M; i++) {
-  //   sum_of_difference += std::abs(host_cutlass[i] - host_reference[i]);
-  // }
-  // if (sum_of_difference > 1e-5) {
-  //   std::cerr << "CUTLASS results incorrect. Sum of difference: " << sum_of_difference << std::endl;
+  double sum_of_difference = 0;
+  for (int i=0;i<ldc * N; i++) {
+    sum_of_difference += std::abs(host_cutlass[i] - host_reference[i]);
+  }
+  if (sum_of_difference > 1e-5) {
+    std::cerr << "CUTLASS results incorrect. Sum of difference: " << sum_of_difference << std::endl;
 
-  //   return cudaErrorUnknown;
-  // }
+    return cudaErrorUnknown;
+  }
 
   return cudaSuccess;
 }

@@ -33,6 +33,9 @@ endif()
 message(STATUS "CMake Version: ${CMAKE_VERSION}")
 
 project(CUTLASS VERSION 2.5.0 LANGUAGES CXX)
+
+list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
+
 include(${CMAKE_CURRENT_SOURCE_DIR}/CUDA.cmake)
 
 find_package(Doxygen QUIET)

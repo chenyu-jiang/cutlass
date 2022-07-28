@@ -51,6 +51,21 @@ void Kernel(typename Operator::Params params) {
   op(params, *shared_storage);
 }
 
+template <typename Operator>
+__global__
+void KernelWithProgress(typename Operator::Params params, volatile int* progress) {
+  // Dynamic shared memory base pointer
+  extern __shared__ int SharedStorageBase[];
+
+  // Declare pointer to dynamic shared memory.
+  typename Operator::SharedStorage *shared_storage =
+      reinterpret_cast<typename Operator::SharedStorage *>(SharedStorageBase);
+
+  Operator op;
+
+  op(params, progress, *shared_storage);
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 } /// namespace cutlass
 

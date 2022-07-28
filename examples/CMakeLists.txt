@@ -20,6 +20,9 @@
 # STRICT LIABILITY, OR TOR (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+find_package(MPI REQUIRED)
+find_package(NCCL REQUIRED)
+
 set(CUTLASS_EXAMPLES_COMMON_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/common)
 
 add_custom_target(cutlass_examples)
@@ -41,12 +44,26 @@ function(cutlass_example_add_executable NAME)
     PRIVATE
     CUTLASS
     cutlass_tools_util_includes
+    ${MPI_CXX_LIBRARIES}
+    ${NCCL_LIBRARY}
     )
+  
+  # if(MPI_COMPILE_FLAGS)
+  #   set_target_properties(${NAME} PROPERTIES
+  #     COMPILE_FLAGS ${MPI_CXX_COMPILE_FLAGS})
+  # endif()
+
+  # if(MPI_LINK_FLAGS)
+  #   set_target_properties(${NAME} PROPERTIES
+  #     LINK_FLAGS ${MPI_CXX_LINK_FLAGS})
+  # endif()
 
   target_include_directories(
     ${NAME}
     PRIVATE
     ${CUTLASS_EXAMPLES_COMMON_SOURCE_DIR}
+    ${MPI_CXX_INCLUDE_DIRS}
+    ${NCCL_INCLUDE_DIR}
     )
 
   install(

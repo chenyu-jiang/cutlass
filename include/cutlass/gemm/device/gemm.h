@@ -28,10 +28,13 @@
 
 #pragma once
 
+#include <iostream>
 #include "cutlass/cutlass.h"
 #include "cutlass/numeric_types.h"
 #include "cutlass/arch/arch.h"
 #include "cutlass/device_kernel.h"
+
+#include "cutlass/layout/matrix.h"
 
 #include "cutlass/gemm/threadblock/threadblock_swizzle.h"
 #include "cutlass/gemm/kernel/gemm.h"
@@ -471,6 +474,41 @@ public:
     return result == cudaSuccess ? Status::kSuccess : Status::kErrorInternal;
   }
 
+  Status run(cudaStream_t stream, volatile int* progress) {
+
+    ThreadblockSwizzle threadblock_swizzle;
+
+    dim3 grid = threadblock_swizzle.get_grid_shape(params_.grid_tiled_shape);
+    dim3 block(GemmKernel::kThreadCount, 1, 1);
+
+    cudaError_t result;
+
+    int smem_size = int(sizeof(typename GemmKernel::SharedStorage));
+    if (smem_size >= (48 << 10)) {
+      result = cudaFuncSetAttribute(KernelWithProgress<GemmKernel>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    smem_size);
+
+      if (result != cudaSuccess) {
+        return Status::kErrorInternal;
+      }
+
+      result = cudaFuncSetAttribute(
+          KernelWithProgress<GemmKernel>,
+          cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+
+      if (result != cudaSuccess) {
+        return Status::kErrorInternal;
+      }
+    }
+
+    cutlass::KernelWithProgress<GemmKernel><<<grid, block, smem_size, stream>>>(params_, progress);
+
+    result = cudaGetLastError();
+
+    return result == cudaSuccess ? Status::kSuccess : Status::kErrorInternal;
+  }
+
   /// Runs the kernel using initialized state.
   Status operator()(cudaStream_t stream = nullptr) {
     return run(stream);
@@ -486,6 +524,20 @@ public:
     
     if (status == Status::kSuccess) {
       status = run(stream);
+    }
+
+    return status;
+  }
+
+  Status operator()(
+    Arguments const &args, volatile int* progress,
+    void *workspace = nullptr, 
+    cudaStream_t stream = nullptr) {
+    
+    Status status = initialize(args, workspace, stream);
+    
+    if (status == Status::kSuccess) {
+      status = run(stream, progress);
     }
 
     return status;
@@ -572,7 +624,7 @@ class Gemm<ElementA_, LayoutA_, ElementB_, LayoutB_, ElementC_,
     ElementA,
     typename layout::LayoutTranspose<LayoutA>::type,
     ElementC,
-    layout::RowMajor,    
+    layout::RowMajor,
     ElementAccumulator,
     OperatorClass,
     ArchTag,
@@ -647,10 +699,13 @@ public:
 
   /// Helper to construct a transposed equivalent for the underying GEMM operator
   static UnderlyingArguments to_underlying_arguments(Arguments const &args) {
+    // std::cout << "Using transposed equivalent.." << std::endl;
     return UnderlyingArguments(
       {args.problem_size.n(), args.problem_size.m(), args.problem_size.k()},
+      // {args.problem_size.m(), args.problem_size.n(), args.problem_size.k()},
       {args.ref_B.data(), args.ref_B.stride(0)},
       {args.ref_A.data(), args.ref_A.stride(0)},
+      // {args.ref_B.data(), args.ref_B.stride(0)},
       {args.ref_C.data(), args.ref_C.stride(0)},
       {args.ref_D.data(), args.ref_D.stride(0)},
       args.epilogue,
@@ -684,8 +739,12 @@ public:
 
   /// Runs the kernel using initialized state.
   Status run(cudaStream_t stream = nullptr) {
-
     return underlying_operator_.run(stream);
+  }
+
+  /// Runs the kernel using initialized state.
+  Status run(cudaStream_t stream, volatile int* progress) {
+    return underlying_operator_.run(stream, progress);
   }
 
   /// Runs the kernel using initialized state.
@@ -703,6 +762,21 @@ public:
     
     if (status == Status::kSuccess) {
       status = run(stream);
+    }
+
+    return status;
+  }
+
+  /// Runs the kernel using initialized state.
+  Status operator()(
+    Arguments const &args, volatile int* progress,
+    void *workspace = nullptr, 
+    cudaStream_t stream = nullptr) {
+    
+    Status status = initialize(args, workspace, stream);
+    
+    if (status == Status::kSuccess) {
+      status = run(stream, progress);
     }
 
     return status;

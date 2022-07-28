@@ -86,7 +86,7 @@
 #define BLOCK_REPEAT 4
 #define BLOCK_DIM ((THREAD_BLOCK_SIZE)*(BLOCK_REPEAT))
 
-#define COMM_UNIT_LANES 2
+#define COMM_UNIT_LANES 4
 
 #define MPICHECK(cmd) do {                          \
   int e = cmd;                                      \
@@ -185,14 +185,13 @@ cudaError_t CutlassSgemmNN(
   // To view the full gemm device API interface, see `cutlass/gemm/device/gemm.h`
 
   using ColumnMajor = cutlass::layout::ColumnMajor;
-  using RowMajor = cutlass::layout::RowMajor;
 
   using CutlassGemm = cutlass::gemm::device::Gemm<float,        // Data-type of A matrix
-                                                  RowMajor,  // Layout of A matrix
+                                                  ColumnMajor,  // Layout of A matrix
                                                   float,        // Data-type of B matrix
-                                                  RowMajor,  // Layout of B matrix
+                                                  ColumnMajor,  // Layout of B matrix
                                                   float,        // Data-type of C matrix
-                                                  RowMajor>; // Layout of C matrix
+                                                  ColumnMajor>; // Layout of C matrix
 
   // Define a CUTLASS GEMM type
   CutlassGemm gemm_operator;
@@ -241,7 +240,7 @@ cudaError_t CutlassSgemmNN(
 /// Kernel to initialize a matrix with small integers.
 __global__ void InitializeMatrix_kernel(
   float *matrix,
-  int ldn,
+  int ldm,
   int rows,
   int columns,
   int seed = 0) {
@@ -249,8 +248,8 @@ __global__ void InitializeMatrix_kernel(
   int i = threadIdx.x + blockIdx.x * blockDim.x;
   int j = threadIdx.y + blockIdx.y * blockDim.y;
 
-  if (i < columns && j < rows) {
-    int offset = i + j * ldn;
+  if (i < rows && j < columns) {
+    int offset = i + j * ldm;
 
     // Generate arbitrary elements.
     int const k = 16807;
@@ -262,15 +261,15 @@ __global__ void InitializeMatrix_kernel(
 }
 
 /// Simple function to initialize a matrix to arbitrary small integers.
-cudaError_t InitializeMatrix(float *matrix, int ldn, int rows, int columns, int seed = 0) {
+cudaError_t InitializeMatrix(float *matrix, int ldm, int rows, int columns, int seed = 0) {
 
   dim3 block(16, 16);
   dim3 grid(
-    (columns + block.x - 1) / block.x,
-    (rows + block.y - 1) / block.y
+    (rows + block.x - 1) / block.x,
+    (columns + block.y - 1) / block.y
   );
 
-  InitializeMatrix_kernel<<< grid, block >>>(matrix, ldn, rows, columns, seed);
+  InitializeMatrix_kernel<<< grid, block >>>(matrix, ldm, rows, columns, seed);
 
   return cudaGetLastError();
 }
@@ -278,10 +277,10 @@ cudaError_t InitializeMatrix(float *matrix, int ldn, int rows, int columns, int 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Allocates device memory for a matrix then fills with arbitrary small integers.
-cudaError_t AllocateMatrix(float **matrix, int ldn, int rows, int columns, int seed = 0) {
+cudaError_t AllocateMatrix(float **matrix, int ldm, int rows, int columns, int seed = 0) {
   cudaError_t result;
 
-  size_t sizeof_matrix = sizeof(float) * ldn * rows;
+  size_t sizeof_matrix = sizeof(float) * ldm * columns;
 
   // Allocate device memory.
   result = cudaMalloc(reinterpret_cast<void **>(matrix), sizeof_matrix);
@@ -302,7 +301,7 @@ cudaError_t AllocateMatrix(float **matrix, int ldn, int rows, int columns, int s
   }
 
   // Initialize matrix elements to arbitrary small integers.
-  result = InitializeMatrix(*matrix, ldn, rows, columns, seed);
+  result = InitializeMatrix(*matrix, ldm, rows, columns, seed);
 
   if (result != cudaSuccess) {
     std::cerr << "Failed to initialize matrix: "
@@ -333,11 +332,11 @@ __global__ void ReferenceGemm_kernel(
     for (int bj=0; bj < BLOCK_REPEAT; bj++) {
       int i = threadIdx.x + blockIdx.x * BLOCK_DIM + bi * THREAD_BLOCK_SIZE;
       int j = threadIdx.y + blockIdx.y * BLOCK_DIM + bj * THREAD_BLOCK_SIZE;
-      if (i < N && j < M) {
+      if (i < M && j < N) {
         float accumulator = 0;
 
         for (int k = 0; k < K; ++k) {
-          accumulator += A[k + j * lda] * B[i + k * ldb];
+          accumulator += A[i + k * lda] * B[k + j * ldb];
         }
 
         C[i + j * ldc] = alpha * accumulator + beta * C[i + j * ldc];
@@ -365,7 +364,7 @@ __global__ void ReferenceGemm_kernel_with_progress(
     for (int bj=0; bj< BLOCK_REPEAT; bj++) {
       int i = threadIdx.x + blockIdx.x * BLOCK_DIM + bi * THREAD_BLOCK_SIZE;
       int j = threadIdx.y + blockIdx.y * BLOCK_DIM + bj * THREAD_BLOCK_SIZE;
-      if (i < N && j < M) {
+      if (i < M && j < N) {
         float accumulator = 0;
 
         for (int k = 0; k < K; ++k) {
@@ -401,8 +400,8 @@ cudaError_t ReferenceGemm(
 
   dim3 block(THREAD_BLOCK_SIZE, THREAD_BLOCK_SIZE);
   dim3 grid(
-    (N + BLOCK_DIM - 1) / BLOCK_DIM,
-    (M + BLOCK_DIM - 1) / BLOCK_DIM
+    (M + BLOCK_DIM - 1) / BLOCK_DIM,
+    (N + BLOCK_DIM - 1) / BLOCK_DIM
   );
 
   ReferenceGemm_kernel<<< grid, block >>>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
@@ -430,7 +429,7 @@ cudaError_t ReferenceGemm_with_progress(
     (N + BLOCK_DIM - 1) / BLOCK_DIM
   );
 
-  ReferenceGemm_kernel_with_progress<<< grid, block >>>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, progress, N / BLOCK_DIM);
+  ReferenceGemm_kernel_with_progress<<< grid, block >>>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, progress, M / BLOCK_DIM);
 
   return cudaGetLastError();
 }
@@ -442,21 +441,18 @@ cudaError_t ReferenceGemm_with_progress(
 cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta, 
                             ncclComm_t& comm, cudaStream_t& s, int rank) {
   cudaError_t result;
-  std::cout << "M: " << M << ", N: " << N << ", K: " << K << std::endl;
+
   //
   // Define several matrices to be used as operands to GEMM kernels.
   //
 
   // Compute leading dimensions for each matrix.
-  // int lda = M;
-  // int ldb = K;
-  // int ldc = M;
-  int lda = K;
-  int ldb = N;
-  int ldc = N;
+  int lda = M;
+  int ldb = K;
+  int ldc = M;
 
   // Compute size in bytes of the C matrix.
-  size_t sizeof_C = sizeof(float) * ldc * M;
+  size_t sizeof_C = sizeof(float) * ldc * N;
 
   // Define pointers to matrices in GPU device memory.
   float *A;
@@ -523,6 +519,22 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta,
 
     return result;
   }
+
+  std::unordered_set<int> unfinished_block_ids;
+  for(int i=0;i<(M/BLOCK_DIM)*(N/BLOCK_DIM);i++) {
+    unfinished_block_ids.insert(i);
+  }
+
+  std::vector<std::unordered_set<int>> comm_lanes_tracker;
+
+  for (int n=0; n<(N / BLOCK_DIM); n++) {
+    std::unordered_set<int> comm_lane_blocks;
+    for (int m=0; m < (M / BLOCK_DIM); m++) {
+      int block_id = (M / BLOCK_DIM) * n + m;
+      comm_lane_blocks.insert(block_id);
+    }
+    comm_lanes_tracker.emplace_back(std::move(comm_lane_blocks));
+  }
   // serialize original arrays
   // std::ofstream Af;
   // std::ofstream Bf;
@@ -556,99 +568,67 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta,
   //
   std::cout << "Launching CUTLASS GEMM kernel." << std::endl;
 
-  std::vector<std::pair<std::chrono::_V2::system_clock::time_point, const int>> timestamps;
+  std::cout << "M: " << M << ", N: " << N << ", K: " << K << std::endl;
 
-  for (int i=0; i<50; i++) {
-    for(int i=0; i < (M/BLOCK_DIM)*(N/BLOCK_DIM); i++) {
-      *(host_progress+i) = 0;
-    }
-
-    std::unordered_set<int> unfinished_block_ids;
-    for(int i=0;i<(M/BLOCK_DIM)*(N/BLOCK_DIM);i++) {
-      unfinished_block_ids.insert(i);
-    }
-
-    std::vector<std::unordered_set<int>> comm_lanes_tracker;
-
-    for (int m=0; m<(M / BLOCK_DIM); m++) {
-      std::unordered_set<int> comm_lane_blocks;
-      for (int n=0; n < (N / BLOCK_DIM); n++) {
-        int block_id = (N / BLOCK_DIM) * m + n;
-        comm_lane_blocks.insert(block_id);
-      }
-      comm_lanes_tracker.emplace_back(std::move(comm_lane_blocks));
-    }
-
-    result = CutlassSgemmNN(M, N, K, alpha, A, lda, B, ldb, beta, C_cutlass, ldc, device_progress);
-    if (result != cudaSuccess) {
-      std::cerr << "CUTLASS GEMM kernel failed: "
-        << cudaGetErrorString(result) << std::endl;
-
-      cudaFree(C_reference);
-      cudaFree(C_cutlass);
-      cudaFree(B);
-      cudaFree(A);
-
-      return result;
-    }
-    // spin check for progress
-    int current_lane = 0;
-    do{
-      int idx_to_remove = -1;
-      for (const auto& elem: unfinished_block_ids) {
-        if (*(host_progress+elem) == 1) {
-          idx_to_remove = elem;
-          timestamps.push_back(std::make_pair(std::chrono::high_resolution_clock::now(), elem));
-          // std::cout << "Block " << elem << " finished." << std::endl;
-          comm_lanes_tracker[elem / (N/BLOCK_DIM)].erase(elem);
-          while (comm_lanes_tracker[current_lane].empty() && current_lane < M/BLOCK_DIM) {
-            current_lane ++;
-            if (current_lane % COMM_UNIT_LANES == 0) {
-              float* buffer = C_cutlass + (current_lane-COMM_UNIT_LANES) * N * BLOCK_DIM;
-              // entire block lane finished, call NCCL
-              // std::cout << "Launching NCCL on offset " << current_lane * N * BLOCK_DIM << "." << std::endl;
-              // NCCLCHECK(ncclAllReduce((const void*)buffer, (void*)buffer, N * BLOCK_DIM * COMM_UNIT_LANES, ncclFloat, ncclSum,
-              // comm, s));
-            }
-          }
-          break;
-        }
-      }
-      if (idx_to_remove != -1) {
-        unfinished_block_ids.erase(idx_to_remove);
-      }
-    }
-    while (!unfinished_block_ids.empty());
-
-    // printf("CUTLASS kernel finished.\n");
-
-    CUDACHECK(cudaDeviceSynchronize());
-    NCCLCHECK(ncclAllReduce((const void*)C_cutlass, (void*)C_cutlass, M*N, ncclFloat, ncclSum,
-    comm, s));
-    CUDACHECK(cudaDeviceSynchronize());
-    // std::cout << "Timestamps: " << std::endl;
-    // for (const auto &st: timestamps) {
-    //   auto timestamp = st.first;
-    //   int block_id = st.second;
-    //   std::cout << timestamp.time_since_epoch().count() << ", Block " << block_id << std::endl;
-    // }
-  }
-  
-  // for (int i=0; i<1; i++)
+  result = CutlassSgemmNN(M, N, K, alpha, A, lda, B, ldb, beta, C_cutlass, ldc, device_progress);
+  // for (int i=0; i<50; i++)
     // result = ReferenceGemm_with_progress(M, N, K, alpha, A, lda, B, ldb, beta, C_cutlass, ldc, device_progress);
 
+  std::vector<std::pair<std::chrono::_V2::system_clock::time_point, const int>> timestamps;
 
-  // if (result != cudaSuccess) {
-  //   std::cerr << "CUTLASS GEMM kernel failed: "
-  //     << cudaGetErrorString(result) << std::endl;
+  if (result != cudaSuccess) {
+    std::cerr << "CUTLASS GEMM kernel failed: "
+      << cudaGetErrorString(result) << std::endl;
 
-  //   cudaFree(C_reference);
-  //   cudaFree(C_cutlass);
-  //   cudaFree(B);
-  //   cudaFree(A);
+    cudaFree(C_reference);
+    cudaFree(C_cutlass);
+    cudaFree(B);
+    cudaFree(A);
 
-  //   return result;
-  // }
+    return result;
+  }
+
+  // spin check for progress
+  int current_lane = 0;
+  do{
+    int idx_to_remove = -1;
+    for (const auto& elem: unfinished_block_ids) {
+      if (*(host_progress+elem) == 1) {
+        idx_to_remove = elem;
+        timestamps.push_back(std::make_pair(std::chrono::high_resolution_clock::now(), elem));
+        // std::cout << "Block " << elem << " finished." << std::endl;
+        comm_lanes_tracker[elem / (M/BLOCK_DIM)].erase(elem);
+        while (comm_lanes_tracker[current_lane].empty() && current_lane < N/BLOCK_DIM) {
+          current_lane ++;
+          if (current_lane % COMM_UNIT_LANES == 0) {
+            float* buffer = C_cutlass + (current_lane-COMM_UNIT_LANES) * M * BLOCK_DIM;
+            // entire block lane finished, call NCCL
+            std::cout << "Launching NCCL on offset " << current_lane * M * BLOCK_DIM << "." << std::endl;
+            NCCLCHECK(ncclAllReduce((const void*)buffer, (void*)buffer, M * BLOCK_DIM * COMM_UNIT_LANES, ncclFloat, ncclSum,
+            comm, s));
+          }
+        }
+        break;
+      }
+    }
+    if (idx_to_remove != -1) {
+      unfinished_block_ids.erase(idx_to_remove);
+    }
+  }
+  while (!unfinished_block_ids.empty());
+
+  printf("CUTLASS kernel finished.\n");
+
+  CUDACHECK(cudaDeviceSynchronize());
+
+  std::cout << "Timestamps: " << std::endl;
+  for (const auto &st: timestamps) {
+    auto timestamp = st.first;
+    int block_id = st.second;
+    std::cout << timestamp.time_since_epoch().count() << ", Block " << block_id << std::endl;
+  }
+ 
+  std::cout << "Launching reference GEMM." << std::endl;
 
   //
   // Verify.
@@ -656,59 +636,59 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta,
 
   // Launch reference GEMM
   // for (int i=0;i<50;i++) 
-  // result = ReferenceGemm(M, N, K, alpha, A, lda, B, ldb, beta, C_reference, ldc);
+  result = ReferenceGemm(M, N, K, alpha, A, lda, B, ldb, beta, C_reference, ldc);
 
-  // if (result != cudaSuccess) {
-  //   std::cerr << "Reference GEMM kernel failed: "
-  //     << cudaGetErrorString(result) << std::endl;
+  if (result != cudaSuccess) {
+    std::cerr << "Reference GEMM kernel failed: "
+      << cudaGetErrorString(result) << std::endl;
 
-  //   cudaFree(C_reference);
-  //   cudaFree(C_cutlass);
-  //   cudaFree(B);
-  //   cudaFree(A);
+    cudaFree(C_reference);
+    cudaFree(C_cutlass);
+    cudaFree(B);
+    cudaFree(A);
 
-  //   return result;
-  // }
+    return result;
+  }
 
-  // CUDACHECK(cudaDeviceSynchronize());
+  CUDACHECK(cudaDeviceSynchronize());
 
-  // // we average reference GEMM as well
-  // NCCLCHECK(ncclAllReduce((const void*)C_reference, (void*)C_reference, M*N, ncclFloat, ncclSum,
-  // comm, s));
+  // we average reference GEMM as well
+  NCCLCHECK(ncclAllReduce((const void*)C_reference, (void*)C_reference, M*N, ncclFloat, ncclSum,
+  comm, s));
 
-  // CUDACHECK(cudaDeviceSynchronize());
+  CUDACHECK(cudaDeviceSynchronize());
 
   // Copy to host and verify equivalence.
-  // std::vector<float> host_cutlass(ldc * M, 0);
-  // std::vector<float> host_reference(ldc * M, 0);
+  std::vector<float> host_cutlass(ldc * N, 0);
+  std::vector<float> host_reference(ldc * N, 0);
 
-  // result = cudaMemcpy(host_cutlass.data(), C_cutlass, sizeof_C, cudaMemcpyDeviceToHost);
+  result = cudaMemcpy(host_cutlass.data(), C_cutlass, sizeof_C, cudaMemcpyDeviceToHost);
 
-  // if (result != cudaSuccess) {
-  //   std::cerr << "Failed to copy CUTLASS GEMM results: "
-  //     << cudaGetErrorString(result) << std::endl;
+  if (result != cudaSuccess) {
+    std::cerr << "Failed to copy CUTLASS GEMM results: "
+      << cudaGetErrorString(result) << std::endl;
 
-  //   cudaFree(C_reference);
-  //   cudaFree(C_cutlass);
-  //   cudaFree(B);
-  //   cudaFree(A);
+    cudaFree(C_reference);
+    cudaFree(C_cutlass);
+    cudaFree(B);
+    cudaFree(A);
 
-  //   return result;
-  // }
+    return result;
+  }
 
-  // result = cudaMemcpy(host_reference.data(), C_reference, sizeof_C, cudaMemcpyDeviceToHost);
+  result = cudaMemcpy(host_reference.data(), C_reference, sizeof_C, cudaMemcpyDeviceToHost);
 
-  // if (result != cudaSuccess) {
-  //   std::cerr << "Failed to copy Reference GEMM results: "
-  //     << cudaGetErrorString(result) << std::endl;
+  if (result != cudaSuccess) {
+    std::cerr << "Failed to copy Reference GEMM results: "
+      << cudaGetErrorString(result) << std::endl;
 
-  //   cudaFree(C_reference);
-  //   cudaFree(C_cutlass);
-  //   cudaFree(B);
-  //   cudaFree(A);
+    cudaFree(C_reference);
+    cudaFree(C_cutlass);
+    cudaFree(B);
+    cudaFree(A);
 
-  //   return result;
-  // }
+    return result;
+  }
 
   CUDACHECK(cudaDeviceSynchronize());
 
@@ -735,15 +715,15 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta,
   //
   // Test for bit equivalence of results.
   //
-  // double sum_of_difference = 0;
-  // for (int i=0;i<ldc * M; i++) {
-  //   sum_of_difference += std::abs(host_cutlass[i] - host_reference[i]);
-  // }
-  // if (sum_of_difference > 1e-5) {
-  //   std::cerr << "CUTLASS results incorrect. Sum of difference: " << sum_of_difference << std::endl;
+  double sum_of_difference = 0;
+  for (int i=0;i<ldc * N; i++) {
+    sum_of_difference += std::abs(host_cutlass[i] - host_reference[i]);
+  }
+  if (sum_of_difference > 1e-5) {
+    std::cerr << "CUTLASS results incorrect. Sum of difference: " << sum_of_difference << std::endl;
 
-  //   return cudaErrorUnknown;
-  // }
+    return cudaErrorUnknown;
+  }
 
   return cudaSuccess;
 }

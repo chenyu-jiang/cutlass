@@ -63,13 +63,13 @@ int RematerializeThreadIdxZ() {
 /// Helper to rematerialize block Idx. Reduces register liveness.
 CUTLASS_DEVICE
 int RematerializeBlockIdxX() {
-  return blockIdx.x;
+  return blockIdx.y;
 }
 
 /// Helper to rematerialize block Idx. Reduces register liveness.
 CUTLASS_DEVICE
 int RematerializeBlockIdxY() {
-  return blockIdx.y;
+  return blockIdx.x;
 }
 
 /// Helper to rematerialize block Idx. Reduces register liveness.
@@ -81,13 +81,13 @@ int RematerializeBlockIdxZ() {
 /// Helper to rematerialize block Dim. Reduces register liveness.
 CUTLASS_DEVICE
 int RematerializeBlockDimX() {
-  return blockDim.x;
+  return blockDim.y;
 }
 
 /// Helper to rematerialize block Dim. Reduces register liveness.
 CUTLASS_DEVICE
 int RematerializeBlockDimY() {
-  return blockDim.y;
+  return blockDim.x;
 }
 
 /// Helper to rematerialize block Dim. Reduces register liveness.
@@ -115,8 +115,10 @@ struct GemmIdentityThreadblockSwizzle {
     int split_k_slices) const {
 
     return GemmCoord(
-      (problem_size.m() + tile_size.m() - 1) / tile_size.m(),
+      // (problem_size.m() + tile_size.m() - 1) / tile_size.m(),
+      // (problem_size.n() + tile_size.n() - 1) / tile_size.n(),
       (problem_size.n() + tile_size.n() - 1) / tile_size.n(),
+      (problem_size.m() + tile_size.m() - 1) / tile_size.m(),
       split_k_slices);
   }
 
@@ -127,6 +129,10 @@ struct GemmIdentityThreadblockSwizzle {
       return dim3(tiled_shape.m(), tiled_shape.n(), tiled_shape.k());
 
     return dim3(tiled_shape.m() * kTile, (tiled_shape.n() + kTile - 1) / kTile, tiled_shape.k());
+    // if ((tiled_shape.m() < kTile) || (tiled_shape.n() < kTile))
+      // return dim3(tiled_shape.n(), tiled_shape.m(), tiled_shape.k());
+
+    // return dim3(tiled_shape.n() * kTile, (tiled_shape.m() + kTile - 1) / kTile, tiled_shape.k());
   }
 
   /// Obtains the threadblock offset (in units of threadblock-scoped tiles)
